@@ -25,8 +25,26 @@
 #include <atomic>
 #include <clamav.h>
 #include <cstring>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
+
+std::string createTempFile();
+
+std::string createTempFile() {
+    char tempFilenameTemplate[] = "/tmp/tempfileXXXXXX";
+    int fd = mkstemp(tempFilenameTemplate);
+    
+    if (fd == -1) {
+        perror("mkstemp failed");
+        return "";
+    }
+    
+    close(fd); // Close the file descriptor, leaving the temporary file.
+    return std::string(tempFilenameTemplate); // The unique temporary filename.
+}
+
+
 
 // Simple thread-safe logger
 class Logger {
@@ -456,7 +474,7 @@ std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
         file.read(buffer.data(), bytesToRead);
         
         // Create a temporary file for this chunk
-        std::string tempFilename = std::tmpnam(nullptr);
+        std::string tempFilename = createTempFile();
         std::ofstream tempFile(tempFilename, std::ios::binary);
         if (!tempFile) {
             logger.log(Logger::ERROR, "Could not create temporary file for chunk scanning");
