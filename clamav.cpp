@@ -440,15 +440,86 @@ std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
     file.seekg(0, std::ios::beg);
     file.close(); // Close the file after checking size
     
-    // Get file extension to check if this is likely an archive
+    // Get file extension as a fallback
     std::string ext = fs::path(filepath).extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    for(char& c : ext) {
+        c = std::tolower(c);
+    }
     
-    // Check if this is a known archive format we can extract
-    bool isTarArchive = (ext == ".tar" || ext == ".tgz" || ext == ".tbz" || ext == ".tbz2");
-    bool isZipArchive = (ext == ".zip");
-    bool isArchive = isTarArchive || isZipArchive || 
-                     (ext == ".gz" || ext == ".bz2" || ext == ".rar" || ext == ".7z");
+    // Check file signature (magic numbers) to determine file type
+    std::ifstream magicFile(filepath, std::ios::binary);
+    if (!magicFile) {
+        logger.log(Logger::ERROR, "Could not open file for type detection: " + filepath);
+        return {false, "error: file could not be opened for type detection"};
+    }
+    
+    unsigned char header[8] = {0};
+    magicFile.read(reinterpret_cast<char*>(header), sizeof(header));
+    magicFile.close();
+    
+    // Detect archive types by magic numbers
+    bool isTarArchive = false;
+    bool isZipArchive = false;
+    bool isGzipArchive = false;
+    bool isBzip2Archive = false;
+    bool isRarArchive = false;
+    bool is7zArchive = false;
+    
+    // ZIP: starts with "PK\x03\x04"
+    if (header[0] == 0x50 && header[1] == 0x4B && header[2] == 0x03 && header[3] == 0x04) {
+        isZipArchive = true;
+        logger.log(Logger::DEBUG, "ZIP archive detected by signature: " + filepath);
+    }
+    // GZIP: starts with "\x1F\x8B"
+    else if (header[0] == 0x1F && header[1] == 0x8B) {
+        isGzipArchive = true;
+        logger.log(Logger::DEBUG, "GZIP archive detected by signature: " + filepath);
+    }
+    // BZIP2: starts with "BZh"
+    else if (header[0] == 0x42 && header[1] == 0x5A && header[2] == 0x68) {
+        isBzip2Archive = true;
+        logger.log(Logger::DEBUG, "BZIP2 archive detected by signature: " + filepath);
+    }
+    // RAR: starts with "Rar!\x1A\x07\x00" or "Rar!\x1A\x07\x01"
+    else if (header[0] == 0x52 && header[1] == 0x61 && header[2] == 0x72 && 
+             header[3] == 0x21 && header[4] == 0x1A && header[5] == 0x07 &&
+             (header[6] == 0x00 || header[6] == 0x01)) {
+        isRarArchive = true;
+        logger.log(Logger::DEBUG, "RAR archive detected by signature: " + filepath);
+    }
+    // 7Z: starts with "7z\xBC\xAF\x27\x1C"
+    else if (header[0] == 0x37 && header[1] == 0x7A && header[2] == 0xBC && 
+             header[3] == 0xAF && header[4] == 0x27 && header[5] == 0x1C) {
+        is7zArchive = true;
+        logger.log(Logger::DEBUG, "7Z archive detected by signature: " + filepath);
+    }
+    
+    // TAR: check file structure or fall back to extension
+    // TAR files don't have a consistent magic number, they're identified by structure
+    // So we'll fall back to extension for TAR files
+    isTarArchive = (ext == ".tar" || ext == ".tgz" || ext == ".tbz" || ext == ".tbz2");
+    
+    // Combine results
+    bool isArchive = isTarArchive || isZipArchive || isGzipArchive || 
+                     isBzip2Archive || isRarArchive || is7zArchive;
+                     
+    // If we didn't detect by magic but the extension suggests an archive, log it
+    if (!isArchive && (ext == ".tar" || ext == ".tgz" || ext == ".tbz" || ext == ".tbz2" || 
+                       ext == ".zip" || ext == ".gz" || ext == ".bz2" || 
+                       ext == ".rar" || ext == ".7z")) {
+        logger.log(Logger::WARNING, "File has archive extension but signature not detected: " + filepath);
+        
+        // Trust the extension for these common types
+        if (ext == ".tar") isTarArchive = true;
+        if (ext == ".zip") isZipArchive = true;
+        if (ext == ".gz")  isGzipArchive = true;
+        if (ext == ".bz2") isBzip2Archive = true;
+        if (ext == ".rar") isRarArchive = true;
+        if (ext == ".7z")  is7zArchive = true;
+        
+        isArchive = isTarArchive || isZipArchive || isGzipArchive || 
+                   isBzip2Archive || isRarArchive || is7zArchive;
+    }
     
     // For small files, use direct scanning
     if (fileSize <= CHUNK_SIZE && !isArchive) {
