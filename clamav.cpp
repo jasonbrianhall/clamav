@@ -26,6 +26,7 @@
 #include <clamav.h>
 #include <cstring>
 #include <unistd.h>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 
@@ -426,6 +427,7 @@ std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
     const size_t CHUNK_SIZE = 30 * 1024 * 1024; // 30 MB chunks
     const size_t OVERLAP_SIZE = 15 * 1024 * 1024; // 15 MB overlap
     
+    // Check if file exists and can be opened
     std::ifstream file(filepath, std::ios::binary);
     if (!file) {
         logger.log(Logger::ERROR, "Could not open file for scanning: " + filepath);
@@ -436,9 +438,20 @@ std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
     file.seekg(0, std::ios::end);
     size_t fileSize = file.tellg();
     file.seekg(0, std::ios::beg);
+    file.close(); // Close the file after checking size
     
-    // If file is small enough, scan directly
-    if (fileSize <= CHUNK_SIZE) {
+    // Get file extension to check if this is likely an archive
+    std::string ext = fs::path(filepath).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    
+    // Check if this is a known archive format we can extract
+    bool isTarArchive = (ext == ".tar" || ext == ".tgz" || ext == ".tbz" || ext == ".tbz2");
+    bool isZipArchive = (ext == ".zip");
+    bool isArchive = isTarArchive || isZipArchive || 
+                     (ext == ".gz" || ext == ".bz2" || ext == ".rar" || ext == ".7z");
+    
+    // For small files, use direct scanning
+    if (fileSize <= CHUNK_SIZE && !isArchive) {
         const char* virus_name = nullptr;
         unsigned long scanned = 0;
         int scan_result = cl_scanfile(filepath.c_str(), &virus_name, &scanned, engine, &scan_options);
@@ -460,25 +473,182 @@ std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
         return {false, "clean"};
     }
     
-    // For larger files, use chunked scanning with overlap
-    logger.log(Logger::INFO, "Large file detected, using chunked scanning: " + filepath);
+    // For archives, try to extract and scan content
+    if (isArchive) {
+        logger.log(Logger::INFO, "Archive detected, extracting and scanning content: " + filepath);
+        
+        // Create a temporary directory for extraction
+        char tempDirTemplate[] = "/tmp/clamav_scan_XXXXXX";
+        char* tempDirPath = mkdtemp(tempDirTemplate);
+        if (tempDirPath == nullptr) {
+            logger.log(Logger::ERROR, "Failed to create temporary directory for archive extraction");
+            return {false, "error: could not create temporary extraction directory"};
+        }
+        
+        std::string tempDir(tempDirPath);
+        logger.log(Logger::DEBUG, "Created temporary directory: " + tempDir);
+        
+        bool extractionSuccess = false;
+        
+        // Extract files based on archive type
+        if (isTarArchive) {
+            // Extract tar using tar command
+            std::string extractCmd = "tar -xf \"" + filepath + "\" -C \"" + tempDir + "\"";
+            logger.log(Logger::DEBUG, "Executing: " + extractCmd);
+            int result = system(extractCmd.c_str());
+            extractionSuccess = (result == 0);
+        } else if (isZipArchive) {
+            // Extract zip using unzip command
+            std::string extractCmd = "unzip -q \"" + filepath + "\" -d \"" + tempDir + "\"";
+            logger.log(Logger::DEBUG, "Executing: " + extractCmd);
+            int result = system(extractCmd.c_str());
+            extractionSuccess = (result == 0);
+        } else {
+            // For other archive types, use libarchive directly or fall back to ClamAV's built-in extraction
+            logger.log(Logger::INFO, "Using ClamAV's built-in extraction for " + ext + " archive");
+            
+            const char* virus_name = nullptr;
+            unsigned long scanned = 0;
+            
+            struct cl_scan_options archive_options = scan_options;
+            archive_options.parse |= CL_SCAN_PARSE_ARCHIVE | CL_SCAN_PARSE_OLE2 | 
+                                    CL_SCAN_PARSE_PDF | CL_SCAN_PARSE_HTML |
+                                    CL_SCAN_PARSE_MAIL;
+            
+            int scan_result = cl_scanfile(filepath.c_str(), &virus_name, &scanned, engine, &archive_options);
+            
+            // Clean up temp dir (though it might be empty in this case)
+            std::string rmCmd = "rm -rf \"" + tempDir + "\"";
+            system(rmCmd.c_str());
+            
+            // Add to total bytes counter
+            total_bytes_scanned += scanned;
+            
+            if (scan_result == CL_VIRUS) {
+                return {true, virus_name ? virus_name : "unknown virus"};
+            } else if (scan_result != CL_CLEAN) {
+                return {false, std::string("Error scanning archive: ") + cl_strerror((cl_error_t)scan_result)};
+            }
+            
+            return {false, "clean"};
+        }
+        
+        if (!extractionSuccess) {
+            logger.log(Logger::ERROR, "Failed to extract archive: " + filepath);
+            
+            // Clean up temp dir
+            std::string rmCmd = "rm -rf \"" + tempDir + "\"";
+            system(rmCmd.c_str());
+            
+            // Fall back to direct scanning with ClamAV's built-in extraction
+            logger.log(Logger::INFO, "Falling back to ClamAV's built-in extraction");
+            const char* virus_name = nullptr;
+            unsigned long scanned = 0;
+            
+            struct cl_scan_options archive_options = scan_options;
+            archive_options.parse |= CL_SCAN_PARSE_ARCHIVE | CL_SCAN_PARSE_OLE2 | 
+                                    CL_SCAN_PARSE_PDF | CL_SCAN_PARSE_HTML |
+                                    CL_SCAN_PARSE_MAIL;
+            
+            int scan_result = cl_scanfile(filepath.c_str(), &virus_name, &scanned, engine, &archive_options);
+            
+            // Add to total bytes counter
+            total_bytes_scanned += scanned;
+            
+            if (scan_result == CL_VIRUS) {
+                return {true, virus_name ? virus_name : "unknown virus"};
+            } else if (scan_result != CL_CLEAN) {
+                return {false, std::string("Error scanning archive: ") + cl_strerror((cl_error_t)scan_result)};
+            }
+            
+            return {false, "clean"};
+        }
+        
+        // Scan each extracted file
+        std::vector<std::string> extracted_files;
+        bool virus_found = false;
+        std::string virus_name_str;
+        
+        // Recursively list all files in the extraction directory
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(tempDir)) {
+                if (fs::is_regular_file(entry)) {
+                    extracted_files.push_back(entry.path().string());
+                }
+            }
+            
+            logger.log(Logger::INFO, "Extracted " + std::to_string(extracted_files.size()) + 
+                      " files from archive");
+            
+            // Scan each extracted file
+            for (const auto& extracted_file : extracted_files) {
+                logger.log(Logger::DEBUG, "Scanning extracted file: " + extracted_file);
+                
+                const char* virus_name = nullptr;
+                unsigned long scanned = 0;
+                int scan_result = cl_scanfile(extracted_file.c_str(), &virus_name, &scanned, engine, &scan_options);
+                
+                // Add to total bytes counter
+                total_bytes_scanned += scanned;
+                
+                if (scan_result == CL_VIRUS) {
+                    logger.log(Logger::WARNING, "Virus found in extracted file: " + extracted_file);
+                    virus_found = true;
+                    virus_name_str = virus_name ? virus_name : "unknown virus";
+                    break; // Stop scanning as soon as a virus is found
+                } else if (scan_result != CL_CLEAN) {
+                    logger.log(Logger::ERROR, "Error scanning extracted file: " + 
+                              std::string(cl_strerror((cl_error_t)scan_result)));
+                }
+            }
+        } catch (const std::exception& e) {
+            logger.log(Logger::ERROR, "Error processing extracted files: " + std::string(e.what()));
+        }
+        
+        // Clean up the temporary directory
+        logger.log(Logger::DEBUG, "Cleaning up temporary directory: " + tempDir);
+        std::string rmCmd = "rm -rf \"" + tempDir + "\"";
+        system(rmCmd.c_str());
+        
+        // Return result
+        if (virus_found) {
+            return {true, virus_name_str};
+        }
+        
+        return {false, "clean"};
+    }
+    
+    // For larger non-archive files, use chunked scanning with overlap
+    logger.log(Logger::INFO, "Large non-archive file detected, using chunked scanning: " + filepath);
     
     std::vector<char> buffer(CHUNK_SIZE);
     size_t position = 0;
+    
+    std::ifstream largeFile(filepath, std::ios::binary);
+    if (!largeFile) {
+        logger.log(Logger::ERROR, "Could not reopen file for chunk scanning: " + filepath);
+        return {false, "error: file could not be reopened for chunk scanning"};
+    }
     
     while (position < fileSize) {
         size_t bytesToRead = std::min(CHUNK_SIZE, fileSize - position);
         
         // Read chunk into memory
-        file.seekg(position);
-        file.read(buffer.data(), bytesToRead);
+        largeFile.seekg(position);
+        largeFile.read(buffer.data(), bytesToRead);
         
         // Create a temporary file for this chunk
         std::string tempFilename = createTempFile();
-        std::ofstream tempFile(tempFilename, std::ios::binary);
-        if (!tempFile) {
+        if (tempFilename.empty()) {
             logger.log(Logger::ERROR, "Could not create temporary file for chunk scanning");
             return {false, "error: could not create temporary chunk file"};
+        }
+        
+        std::ofstream tempFile(tempFilename, std::ios::binary);
+        if (!tempFile) {
+            logger.log(Logger::ERROR, "Could not open temporary file for writing");
+            std::remove(tempFilename.c_str());
+            return {false, "error: could not open temporary file for writing"};
         }
         
         tempFile.write(buffer.data(), bytesToRead);
@@ -521,6 +691,9 @@ std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
             position += (CHUNK_SIZE - OVERLAP_SIZE);
         }
     }
+    
+    // Close the large file after scanning all chunks
+    largeFile.close();
     
     // If we got here, no virus was found
     logger.log(Logger::INFO, "Completed chunked scan of file: " + filepath + 
