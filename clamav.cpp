@@ -24,6 +24,7 @@
 #include <mutex>
 #include <atomic>
 #include <clamav.h>
+#include <cstring>
 
 namespace fs = std::filesystem;
 
