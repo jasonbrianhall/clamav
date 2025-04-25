@@ -312,7 +312,7 @@ private:
     std::atomic<int> files_scanned;
     std::atomic<int> infected_count;
     std::mutex engine_mutex;
-    
+    std::atomic<unsigned long long> total_bytes_scanned = 0;
     // Worker thread function
     void scanWorker(const std::vector<std::string>& files, bool auto_quarantine) {
         for (const auto& file : files) {
@@ -401,15 +401,36 @@ public:
         return true;
     }
     
-    std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
-        std::lock_guard<std::mutex> lock(engine_mutex);
-        
+std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
+    std::lock_guard<std::mutex> lock(engine_mutex);
+    
+    const size_t CHUNK_SIZE = 30 * 1024 * 1024; // 30 MB chunks
+    const size_t OVERLAP_SIZE = 15 * 1024 * 1024; // 15 MB overlap
+    
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file) {
+        logger.log(Logger::ERROR, "Could not open file for scanning: " + filepath);
+        return {false, "error: file could not be opened"};
+    }
+    
+    // Get file size
+    file.seekg(0, std::ios::end);
+    size_t fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+    
+    // If file is small enough, scan directly
+    if (fileSize <= CHUNK_SIZE) {
         const char* virus_name = nullptr;
         unsigned long scanned = 0;
-        int scan_result;
+        int scan_result = cl_scanfile(filepath.c_str(), &virus_name, &scanned, engine, &scan_options);
         
-        // Perform the scan
-        scan_result = cl_scanfile(filepath.c_str(), &virus_name, &scanned, engine, &scan_options);
+        // Add to total bytes counter
+        total_bytes_scanned += scanned;
+        
+        // Log the total bytes scanned after each file
+        logger.log(Logger::DEBUG, "Total bytes scanned so far: " + 
+                   std::to_string(total_bytes_scanned) + " bytes (" + 
+                   std::to_string(total_bytes_scanned / (1024.0 * 1024.0)) + " MB)");
         
         if (scan_result == CL_VIRUS) {
             return {true, virus_name ? virus_name : "unknown virus"};
@@ -419,6 +440,75 @@ public:
         
         return {false, "clean"};
     }
+    
+    // For larger files, use chunked scanning with overlap
+    logger.log(Logger::INFO, "Large file detected, using chunked scanning: " + filepath);
+    
+    std::vector<char> buffer(CHUNK_SIZE);
+    size_t position = 0;
+    
+    while (position < fileSize) {
+        size_t bytesToRead = std::min(CHUNK_SIZE, fileSize - position);
+        
+        // Read chunk into memory
+        file.seekg(position);
+        file.read(buffer.data(), bytesToRead);
+        
+        // Create a temporary file for this chunk
+        std::string tempFilename = std::tmpnam(nullptr);
+        std::ofstream tempFile(tempFilename, std::ios::binary);
+        if (!tempFile) {
+            logger.log(Logger::ERROR, "Could not create temporary file for chunk scanning");
+            return {false, "error: could not create temporary chunk file"};
+        }
+        
+        tempFile.write(buffer.data(), bytesToRead);
+        tempFile.close();
+        
+        // Scan the chunk
+        const char* virus_name = nullptr;
+        unsigned long scanned = 0;
+        int scan_result = cl_scanfile(tempFilename.c_str(), &virus_name, &scanned, engine, &scan_options);
+        
+        // Clean up temporary file
+        std::remove(tempFilename.c_str());
+        
+        // Add to total bytes counter
+        total_bytes_scanned += scanned;
+        
+        // Log progress
+        logger.log(Logger::DEBUG, "Scanned chunk " + std::to_string(position / OVERLAP_SIZE) + 
+                   " of file: " + filepath + " (" + 
+                   std::to_string(position / (1024.0 * 1024.0)) + " MB - " + 
+                   std::to_string((position + bytesToRead) / (1024.0 * 1024.0)) + " MB)");
+        
+        // If virus found, return immediately
+        if (scan_result == CL_VIRUS) {
+            logger.log(Logger::WARNING, "Virus found in chunk at position " + 
+                       std::to_string(position) + " of file: " + filepath);
+            return {true, virus_name ? virus_name : "unknown virus"};
+        } else if (scan_result != CL_CLEAN) {
+            logger.log(Logger::ERROR, "Error scanning chunk of file: " + 
+                       std::string(cl_strerror((cl_error_t)scan_result)));
+            // Continue with other chunks even if one fails
+        }
+        
+        // Move to next position with overlap
+        // If we're at the beginning, move by OVERLAP_SIZE
+        // Otherwise, move by CHUNK_SIZE - OVERLAP_SIZE
+        if (position == 0) {
+            position = OVERLAP_SIZE;
+        } else {
+            position += (CHUNK_SIZE - OVERLAP_SIZE);
+        }
+    }
+    
+    // If we got here, no virus was found
+    logger.log(Logger::INFO, "Completed chunked scan of file: " + filepath + 
+               " (" + std::to_string(fileSize / (1024.0 * 1024.0)) + " MB)");
+    
+    return {false, "clean"};
+}
     
     void scanFiles(const std::vector<std::string>& files, bool auto_quarantine = false, int num_threads = 4) {
         // Reset counters
