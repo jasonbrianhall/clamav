@@ -769,14 +769,21 @@ std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
             return {false, "clean"};
         }
         
-        // Process each extracted file one by one and delete after scanning
+        // Scan each extracted file with recursive handling for nested archives
+        std::vector<std::string> extracted_files;
         bool virus_found = false;
         std::string virus_name_str;
         
-        // Function for processing a single file - returns {infected, virus_name}
-        std::function<std::pair<bool, std::string>(const std::string&, bool)> processSingleFile = 
-            [&](const std::string& file_path, bool delete_after) -> std::pair<bool, std::string> {
-                logger.log(Logger::DEBUG, "Processing file: " + file_path);
+        // Function for recursive scanning of extracted archives
+        std::function<std::pair<bool, std::string>(const std::string&, int)> scanRecursively = 
+            [&](const std::string& file_path, int depth) -> std::pair<bool, std::string> {
+                // Prevent infinite recursion - limit depth to 10 layers
+                if (depth > 10) {
+                    logger.log(Logger::WARNING, "Maximum archive recursion depth (10) reached for: " + file_path);
+                    return {false, "recursion_limit"};
+                }
+                
+                logger.log(Logger::DEBUG, "Recursive scan level " + std::to_string(depth) + ": " + file_path);
                 
                 // Get file size
                 std::error_code ec;
@@ -786,7 +793,13 @@ std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
                     return {false, "file_error"};
                 }
                 
-                // Check if this is an archive by examining header
+                // Determine file type
+                std::string ext = fs::path(file_path).extension().string();
+                for(char& c : ext) {
+                    c = std::tolower(c);
+                }
+                
+                // Check file signature
                 std::ifstream magicFile(file_path, std::ios::binary);
                 if (!magicFile) {
                     logger.log(Logger::ERROR, "Could not open file for type detection: " + file_path);
@@ -804,313 +817,218 @@ std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
                     logger.log(Logger::ERROR, "Error reading file header: " + std::string(e.what()));
                 }
                 
-                // Check for common archive signatures
-                bool isArchive = false;
-                std::string archiveType = "unknown";
+                // Detect archive types by magic numbers
+                bool isNestedArchive = false;
+                bool isTarArchive = false;
+                bool isZipArchive = false;
+                bool isGzipArchive = false;
+                bool isBzip2Archive = false;
+                bool isRarArchive = false;
+                bool is7zArchive = false;
                 
-                // TAR: check for "ustar" at offset 257
-                if (bytes_read >= 262 && header[257] == 'u' && header[258] == 's' && 
-                    header[259] == 't' && header[260] == 'a' && header[261] == 'r') {
-                    isArchive = true;
-                    archiveType = "tar";
-                }
                 // ZIP: starts with "PK\x03\x04"
-                else if (bytes_read >= 4 && header[0] == 0x50 && header[1] == 0x4B && 
+                if (bytes_read >= 4 && header[0] == 0x50 && header[1] == 0x4B && 
                     header[2] == 0x03 && header[3] == 0x04) {
-                    isArchive = true;
-                    archiveType = "zip";
+                    isZipArchive = true;
+                    isNestedArchive = true;
+                    logger.log(Logger::INFO, "Found nested ZIP archive: " + file_path);
                 }
                 // GZIP: starts with "\x1F\x8B"
                 else if (bytes_read >= 2 && header[0] == 0x1F && header[1] == 0x8B) {
-                    isArchive = true;
-                    archiveType = "gzip";
+                    isGzipArchive = true;
+                    isNestedArchive = true;
+                    logger.log(Logger::INFO, "Found nested GZIP archive: " + file_path);
                 }
                 // BZIP2: starts with "BZh"
                 else if (bytes_read >= 3 && header[0] == 0x42 && header[1] == 0x5A && header[2] == 0x68) {
-                    isArchive = true;
-                    archiveType = "bzip2";
+                    isBzip2Archive = true;
+                    isNestedArchive = true;
+                    logger.log(Logger::INFO, "Found nested BZIP2 archive: " + file_path);
                 }
                 // RAR: starts with "Rar!\x1A\x07\x00" or "Rar!\x1A\x07\x01"
                 else if (bytes_read >= 7 && header[0] == 0x52 && header[1] == 0x61 && 
-                    header[2] == 0x72 && header[3] == 0x21 && header[4] == 0x1A && 
-                    header[5] == 0x07 && (header[6] == 0x00 || header[6] == 0x01)) {
-                    isArchive = true;
-                    archiveType = "rar";
+                         header[2] == 0x72 && header[3] == 0x21 && header[4] == 0x1A && 
+                         header[5] == 0x07 && (header[6] == 0x00 || header[6] == 0x01)) {
+                    isRarArchive = true;
+                    isNestedArchive = true;
+                    logger.log(Logger::INFO, "Found nested RAR archive: " + file_path);
                 }
                 // 7Z: starts with "7z\xBC\xAF\x27\x1C"
                 else if (bytes_read >= 6 && header[0] == 0x37 && header[1] == 0x7A && 
-                    header[2] == 0xBC && header[3] == 0xAF && header[4] == 0x27 && 
-                    header[5] == 0x1C) {
-                    isArchive = true;
-                    archiveType = "7z";
+                         header[2] == 0xBC && header[3] == 0xAF && header[4] == 0x27 && 
+                         header[5] == 0x1C) {
+                    is7zArchive = true;
+                    isNestedArchive = true;
+                    logger.log(Logger::INFO, "Found nested 7Z archive: " + file_path);
+                }
+                // TAR: check for "ustar" at offset 257
+                else if (bytes_read >= 262 && header[257] == 'u' && header[258] == 's' && 
+                         header[259] == 't' && header[260] == 'a' && header[261] == 'r') {
+                    isTarArchive = true;
+                    isNestedArchive = true;
+                    logger.log(Logger::INFO, "Found nested TAR archive: " + file_path);
                 }
                 
-                // If it's an archive, extract and process
-                if (isArchive) {
-                    logger.log(Logger::INFO, "Detected " + archiveType + " archive: " + file_path);
+                // Also check by extension if signature check failed
+                if (!isNestedArchive && (ext == ".tar" || ext == ".tgz" || ext == ".tbz" || 
+                                     ext == ".tbz2" || ext == ".zip" || ext == ".gz" || 
+                                     ext == ".bz2" || ext == ".rar" || ext == ".7z")) {
+                    // Trust the extension for common types
+                    if (ext == ".tar") {
+                        isTarArchive = true;
+                        isNestedArchive = true;
+                    }
+                    else if (ext == ".zip") {
+                        isZipArchive = true;
+                        isNestedArchive = true;
+                    }
+                    else if (ext == ".gz" || ext == ".tgz") {
+                        isGzipArchive = true;
+                        isNestedArchive = true;
+                    }
+                    else if (ext == ".bz2" || ext == ".tbz" || ext == ".tbz2") {
+                        isBzip2Archive = true;
+                        isNestedArchive = true;
+                    }
+                    else if (ext == ".rar") {
+                        isRarArchive = true;
+                        isNestedArchive = true;
+                    }
+                    else if (ext == ".7z") {
+                        is7zArchive = true;
+                        isNestedArchive = true;
+                    }
                     
-                    // Create a temporary directory for extraction
-                    char nested_temp_dir[] = "/tmp/clamav_nested_XXXXXX";
-                    char* nested_dir_path = mkdtemp(nested_temp_dir);
-                    if (nested_dir_path == nullptr) {
+                    if (isNestedArchive) {
+                        logger.log(Logger::INFO, "Found nested archive by extension: " + file_path);
+                    }
+                }
+                
+                // If this is a nested archive, extract and scan its contents
+                if (isNestedArchive) {
+                    // Create a temporary directory for nested extraction
+                    char nestedTempDir[] = "/tmp/clamav_nested_XXXXXX";
+                    char* nestedDirPath = mkdtemp(nestedTempDir);
+                    if (nestedDirPath == nullptr) {
                         logger.log(Logger::ERROR, "Failed to create temp dir for nested archive: " + file_path);
                         // Fall back to direct scanning
                         goto direct_scan;
                     }
                     
-                    std::string nested_dir(nested_dir_path);
-                    logger.log(Logger::DEBUG, "Created temporary directory: " + nested_dir);
+                    std::string nestedDir(nestedDirPath);
+                    logger.log(Logger::DEBUG, "Created nested temporary directory: " + nestedDir);
                     
-                    // Extract based on archive type
-                    bool extraction_success = false;
-                    std::string extract_cmd;
+                    bool extractionSuccess = false;
                     
-                    if (archiveType == "tar") {
-                        extract_cmd = "tar -xf \"" + file_path + "\" -C \"" + nested_dir + "\"";
-                    } else if (archiveType == "zip") {
-                        extract_cmd = "unzip -q \"" + file_path + "\" -d \"" + nested_dir + "\"";
-                    } else if (archiveType == "gzip") {
+                    // Extract files based on archive type
+                    if (isTarArchive) {
+                        std::string extractCmd = "tar -xf \"" + file_path + "\" -C \"" + nestedDir + "\"";
+                        logger.log(Logger::DEBUG, "Executing: " + extractCmd);
+                        int result = system(extractCmd.c_str());
+                        extractionSuccess = (result == 0);
+                    } else if (isZipArchive) {
+                        std::string extractCmd = "unzip -q \"" + file_path + "\" -d \"" + nestedDir + "\"";
+                        logger.log(Logger::DEBUG, "Executing: " + extractCmd);
+                        int result = system(extractCmd.c_str());
+                        extractionSuccess = (result == 0);
+                    } else if (isGzipArchive) {
                         std::string basename = fs::path(file_path).filename().string();
                         if (basename.length() > 3 && basename.substr(basename.length() - 3) == ".gz") {
                             basename = basename.substr(0, basename.length() - 3);
                         }
                         
-                        std::string outputFile = nested_dir + "/" + basename;
-                        extract_cmd = "gzip -dc \"" + file_path + "\" > \"" + outputFile + "\"";
-                    } else if (archiveType == "bzip2") {
+                        std::string outputFile = nestedDir + "/" + basename;
+                        std::string extractCmd = "gzip -dc \"" + file_path + "\" > \"" + outputFile + "\"";
+                        logger.log(Logger::DEBUG, "Executing: " + extractCmd);
+                        int result = system(extractCmd.c_str());
+                        extractionSuccess = (result == 0);
+                    } else if (isBzip2Archive) {
                         std::string basename = fs::path(file_path).filename().string();
                         if (basename.length() > 4 && basename.substr(basename.length() - 4) == ".bz2") {
                             basename = basename.substr(0, basename.length() - 4);
                         }
                         
-                        std::string outputFile = nested_dir + "/" + basename;
-                        extract_cmd = "bzip2 -dc \"" + file_path + "\" > \"" + outputFile + "\"";
-                    } else if (archiveType == "rar") {
-                        extract_cmd = "unrar x -o+ \"" + file_path + "\" \"" + nested_dir + "\"";
-                    } else if (archiveType == "7z") {
-                        extract_cmd = "7z x -o\"" + nested_dir + "\" \"" + file_path + "\"";
+                        std::string outputFile = nestedDir + "/" + basename;
+                        std::string extractCmd = "bzip2 -dc \"" + file_path + "\" > \"" + outputFile + "\"";
+                        logger.log(Logger::DEBUG, "Executing: " + extractCmd);
+                        int result = system(extractCmd.c_str());
+                        extractionSuccess = (result == 0);
+                    } else if (isRarArchive) {
+                        std::string extractCmd = "unrar x -o+ \"" + file_path + "\" \"" + nestedDir + "\"";
+                        logger.log(Logger::DEBUG, "Executing: " + extractCmd);
+                        int result = system(extractCmd.c_str());
+                        extractionSuccess = (result == 0);
+                    } else if (is7zArchive) {
+                        std::string extractCmd = "7z x -o\"" + nestedDir + "\" \"" + file_path + "\"";
+                        logger.log(Logger::DEBUG, "Executing: " + extractCmd);
+                        int result = system(extractCmd.c_str());
+                        extractionSuccess = (result == 0);
                     }
                     
-                    // Execute extraction command
-                    logger.log(Logger::DEBUG, "Executing: " + extract_cmd);
-                    int result = system(extract_cmd.c_str());
-                    extraction_success = (result == 0);
-                    
-                    if (extraction_success) {
-                        // Get list of extracted files
-                        std::vector<std::string> extracted_files;
+                    if (extractionSuccess) {
+                        std::vector<std::string> nested_files;
+                        
+                        // List all files in the nested extraction directory
                         try {
-                            for (const auto& entry : fs::directory_iterator(nested_dir)) {
+                            for (const auto& entry : fs::recursive_directory_iterator(nestedDir)) {
                                 if (fs::is_regular_file(entry)) {
-                                    extracted_files.push_back(entry.path().string());
+                                    nested_files.push_back(entry.path().string());
                                 }
                             }
                             
-                            logger.log(Logger::INFO, "Extracted " + std::to_string(extracted_files.size()) + 
-                                      " files from " + archiveType + " archive");
+                            logger.log(Logger::INFO, "Extracted " + std::to_string(nested_files.size()) + 
+                                      " files from nested archive: " + file_path);
                             
-                            // Process each extracted file one by one
-                            for (const auto& extracted_file : extracted_files) {
-                                // Recursively process the extracted file
-                                auto [nested_infected, nested_virus] = processSingleFile(extracted_file, true);
+                            // Recursive scan each extracted file
+                            for (const auto& nested_file : nested_files) {
+                                // Use recursion to handle nested archives
+                                auto [nested_infected, nested_virus] = scanRecursively(nested_file, depth + 1);
                                 
                                 if (nested_infected) {
-                                    // Virus found in nested file
-                                    logger.log(Logger::WARNING, "Virus found in " + extracted_file + 
-                                              " extracted from " + file_path + ": " + nested_virus);
+                                    logger.log(Logger::WARNING, "Virus found in nested archive: " + 
+                                              nested_file + " (from " + file_path + ") - " + nested_virus);
                                     
-                                    // Clean up the extraction directory
-                                    std::string rm_cmd = "rm -rf \"" + nested_dir + "\"";
-                                    system(rm_cmd.c_str());
-                                    
-                                    // Delete the original file if requested
-                                    if (delete_after) {
-                                        fs::remove(file_path);
-                                        logger.log(Logger::DEBUG, "Deleted: " + file_path);
-                                    }
+                                    // Clean up before returning
+                                    std::string rmCmd = "rm -rf \"" + nestedDir + "\"";
+                                    system(rmCmd.c_str());
                                     
                                     return {true, nested_virus};
                                 }
-                                
-                                // Delete the extracted file immediately after scanning
-                                fs::remove(extracted_file);
-                                logger.log(Logger::DEBUG, "Deleted extracted file: " + extracted_file);
                             }
                             
-                            // Check for subdirectories with additional files
-                            std::vector<std::string> subdirs;
-                            for (const auto& entry : fs::directory_iterator(nested_dir)) {
-                                if (fs::is_directory(entry)) {
-                                    subdirs.push_back(entry.path().string());
-                                }
-                            }
+                            // If we get here, no virus was found in the nested archive
+                            logger.log(Logger::DEBUG, "No virus found in nested archive: " + file_path);
                             
-                            // Process each subdirectory
-                            for (const auto& subdir : subdirs) {
-                                std::vector<std::string> subdir_files;
-                                try {
-                                    for (const auto& entry : fs::recursive_directory_iterator(subdir)) {
-                                        if (fs::is_regular_file(entry)) {
-                                            subdir_files.push_back(entry.path().string());
-                                        }
-                                    }
-                                    
-                                    // Process each file in the subdirectory
-                                    for (const auto& subdir_file : subdir_files) {
-                                        auto [subdir_infected, subdir_virus] = processSingleFile(subdir_file, true);
-                                        
-                                        if (subdir_infected) {
-                                            // Virus found in subdirectory file
-                                            logger.log(Logger::WARNING, "Virus found in " + subdir_file + 
-                                                      " (subdirectory) extracted from " + file_path + ": " + 
-                                                      subdir_virus);
-                                            
-                                            // Clean up the extraction directory
-                                            std::string rm_cmd = "rm -rf \"" + nested_dir + "\"";
-                                            system(rm_cmd.c_str());
-                                            
-                                            // Delete the original file if requested
-                                            if (delete_after) {
-                                                fs::remove(file_path);
-                                                logger.log(Logger::DEBUG, "Deleted: " + file_path);
-                                            }
-                                            
-                                            return {true, subdir_virus};
-                                        }
-                                    }
-                                } catch (const std::exception& e) {
-                                    logger.log(Logger::ERROR, "Error processing subdirectory files: " + 
-                                              std::string(e.what()));
-                                }
-                            }
-                            
-                            // No virus found in the archive, clean up
-                            std::string rm_cmd = "rm -rf \"" + nested_dir + "\"";
-                            system(rm_cmd.c_str());
-                            
-                            // Delete the original file if requested
-                            if (delete_after) {
-                                fs::remove(file_path);
-                                logger.log(Logger::DEBUG, "Deleted: " + file_path);
-                            }
+                            // Clean up the temporary directory
+                            std::string rmCmd = "rm -rf \"" + nestedDir + "\"";
+                            system(rmCmd.c_str());
                             
                             return {false, "clean"};
                             
                         } catch (const std::exception& e) {
-                            logger.log(Logger::ERROR, "Error listing extracted files: " + std::string(e.what()));
+                            logger.log(Logger::ERROR, "Error processing nested archive: " + 
+                                      std::string(e.what()));
                             
-                            // Clean up and fall back to direct scan
-                            std::string rm_cmd = "rm -rf \"" + nested_dir + "\"";
-                            system(rm_cmd.c_str());
-                            goto direct_scan;
+                            // Clean up and fall back to direct scanning
+                            std::string rmCmd = "rm -rf \"" + nestedDir + "\"";
+                            system(rmCmd.c_str());
                         }
                     } else {
-                        logger.log(Logger::WARNING, "Failed to extract " + archiveType + " archive: " + file_path);
+                        logger.log(Logger::WARNING, "Failed to extract nested archive: " + file_path);
                         
                         // Clean up
-                        std::string rm_cmd = "rm -rf \"" + nested_dir + "\"";
-                        system(rm_cmd.c_str());
-                        
-                        // Fall back to direct scan
-                        goto direct_scan;
+                        std::string rmCmd = "rm -rf \"" + nestedDir + "\"";
+                        system(rmCmd.c_str());
                     }
                 }
                 
-                // Direct scan for non-archive files or when extraction fails
+                // If we couldn't process as an archive or it's not an archive, scan directly
             direct_scan:
                 const char* virus_name = nullptr;
                 unsigned long scanned = 0;
                 int scan_result = cl_scanfile(file_path.c_str(), &virus_name, &scanned, engine, &scan_options);
                 
                 // Add to total bytes counter
-                total_bytes_scanned += scanned;
-                
-                // Delete the file if requested (after scanning)
-                if (delete_after) {
-                    fs::remove(file_path);
-                    logger.log(Logger::DEBUG, "Deleted: " + file_path);
-                }
-                
-                if (scan_result == CL_VIRUS) {
-                    logger.log(Logger::WARNING, "Virus found in file: " + file_path);
-                    return {true, virus_name ? virus_name : "unknown virus"};
-                } else if (scan_result != CL_CLEAN) {
-                    logger.log(Logger::ERROR, "Error scanning file: " + 
-                              std::string(cl_strerror((cl_error_t)scan_result)));
-                }
-                
-                return {false, "clean"};
-            };
-        
-        try {
-            // List all files at the top level of the extracted directory
-            std::vector<std::string> top_level_files;
-            for (const auto& entry : fs::directory_iterator(tempDir)) {
-                if (fs::is_regular_file(entry)) {
-                    top_level_files.push_back(entry.path().string());
-                }
-            }
-            
-            logger.log(Logger::INFO, "Found " + std::to_string(top_level_files.size()) + 
-                      " top-level files in archive");
-            
-            // Process each file one at a time
-            for (const auto& file : top_level_files) {
-                auto [file_infected, file_virus] = processSingleFile(file, true);
-                
-                if (file_infected) {
-                    virus_found = true;
-                    virus_name_str = file_virus;
-                    break; // Found a virus, stop processing
-                }
-                // Files are deleted automatically by processSingleFile
-            }
-            
-            // Process subdirectories next
-            std::vector<std::string> top_level_dirs;
-            for (const auto& entry : fs::directory_iterator(tempDir)) {
-                if (fs::is_directory(entry)) {
-                    top_level_dirs.push_back(entry.path().string());
-                }
-            }
-            
-            // Process each subdirectory
-            for (const auto& dir : top_level_dirs) {
-                std::vector<std::string> dir_files;
-                try {
-                    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
-                        if (fs::is_regular_file(entry)) {
-                            dir_files.push_back(entry.path().string());
-                        }
-                    }
-                    
-                    // Process each file in the subdirectory
-                    for (const auto& dir_file : dir_files) {
-                        auto [dir_file_infected, dir_file_virus] = processSingleFile(dir_file, true);
-                        
-                        if (dir_file_infected) {
-                            virus_found = true;
-                            virus_name_str = dir_file_virus;
-                            break; // Found a virus, stop processing
-                        }
-                        // Files are deleted automatically by processSingleFile
-                    }
-                    
-                    if (virus_found) {
-                        break; // Found a virus, stop processing directories
-                    }
-                    
-                    // Remove the empty directory after processing its files
-                    fs::remove_all(dir);
-                    
-                } catch (const std::exception& e) {
-                    logger.log(Logger::ERROR, "Error processing subdirectory: " + std::string(e.what()));
-                }
-            }
-            
-        } catch (const std::exception& e) {
-            logger.log(Logger::ERROR, "Error processing extracted files: " + std::string(e.what()));
-        }d to total bytes counter
                 total_bytes_scanned += scanned;
                 
                 if (scan_result == CL_VIRUS) {
@@ -1170,8 +1088,7 @@ std::pair<bool, std::string> scanSingleFile(const std::string& filepath) {
     // For large files that aren't archives, explicitly state we can't determine file type
     if (fileSize > CHUNK_SIZE && !isArchive) {
         // Try with ClamAV's built-in detection capabilities first
-        logger.log(Logger::INFO, "Large file, but could not determine specific archive type. " +
-                  "Attempting direct scan with ClamAV first: " + filepath);
+        printf("Large file, but could not determine specific archive type.  Attempting direct scan with ClamAV first\n");
                   
         const char* virus_name = nullptr;
         unsigned long scanned = 0;
