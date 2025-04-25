@@ -1,6 +1,6 @@
 CC = g++
 CFLAGS = -std=c++17 -Wall -Wextra
-LDFLAGS = -lclamav -lboost_filesystem -lboost_system
+LDFLAGS = -lclamav -lboost_filesystem -lboost_system -pthread
 TARGET = virus_scanner
 SRC = clamav.cpp
 
